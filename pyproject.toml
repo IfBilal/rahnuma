@@ -1,0 +1,17 @@
+[project]
+name = "rahnuma"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.139.0",
+    "langchain>=1.3.13",
+    "langchain-google-genai>=4.2.7",
+    "langchain-groq>=1.1.3",
+    "langgraph>=1.2.9",
+    "langgraph-checkpoint-postgres>=3.1.0",
+    "psycopg[binary]>=3.3.4",
+    "pypdf>=6.14.2",
+    "uvicorn>=0.51.0",
+]
