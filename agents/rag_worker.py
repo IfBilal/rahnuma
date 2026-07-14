@@ -28,6 +28,8 @@ from ingestion.loader import load_pdf
 from ingestion.store import get_vector_store
 from pathlib import Path
 
+from agents.web_worker import build_web_graph
+
 llm = init_chat_model("groq:llama-3.3-70b-versatile")
 store = get_vector_store()
 
@@ -52,6 +54,7 @@ def build_hybrid_retriever(k: int = 5):
 
 
 retriever = build_hybrid_retriever()
+web_graph = build_web_graph()
 
 
 class RAGState(TypedDict):
@@ -121,15 +124,11 @@ def answer(state: RAGState) -> dict:
 
 
 def fallback(state: RAGState) -> dict:
-    # TODO: once the web worker (Tavily) exists, fall back to a live web
-    # search here instead of just admitting the corpus lacks this info.
-    from langchain_core.messages import AIMessage
-
-    message = (
-        "I don't have enough information in the corpus to answer that confidently. "
-        "(Live web fallback isn't implemented yet — coming with the web worker.)"
-    )
-    return {"messages": [AIMessage(content=message)]}
+    # corrective RAG: corpus retrieval failed the relevance check, so escalate
+    # to the live web worker instead — for stale/missing corpus info (e.g.
+    # current-cycle deadlines the prospectus doesn't have yet).
+    result = web_graph.invoke({"messages": [{"role": "user", "content": state["rewritten_query"]}]})
+    return {"messages": [result["messages"][-1]]}
 
 
 def build_rag_graph(checkpointer=None):
