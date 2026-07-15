@@ -14,6 +14,7 @@ import os
 from typing import Literal, TypedDict
 
 from langchain.chat_models import init_chat_model
+from langchain_core.messages import AIMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.types import Command
@@ -35,6 +36,7 @@ class SupervisorState(TypedDict):
     messages: Annotated[list, add_messages]
     context: str  # sources the last worker used, so the critic can check grounding
     retry_count: int
+    current_worker: str  # which worker produced the last answer, so critic can retry it directly
 
 
 ROUTING_PROMPT = """Classify the user's question into exactly one category:
@@ -71,7 +73,11 @@ def eligibility_worker(state: SupervisorState) -> dict:
         if m.type == "tool":
             context_parts.append(f"Tool result: {m.content}")
 
-    return {"messages": [result["messages"][-1]], "context": "\n".join(context_parts)}
+    return {
+        "messages": [result["messages"][-1]],
+        "context": "\n".join(context_parts),
+        "current_worker": "eligibility_worker",
+    }
 
 
 rag_graph = build_rag_graph()
@@ -79,7 +85,11 @@ rag_graph = build_rag_graph()
 
 def rag_worker(state: SupervisorState) -> dict:
     result = rag_graph.invoke({"messages": state["messages"]})
-    return {"messages": [result["messages"][-1]], "context": result.get("context", "")}
+    return {
+        "messages": [result["messages"][-1]],
+        "context": result.get("context", ""),
+        "current_worker": "rag_worker",
+    }
 
 
 CRITIC_PROMPT = """Question: {question}
@@ -95,7 +105,7 @@ hallucinated numbers, no claims the sources don't support? Answer with
 exactly one word: "approved" or "rejected"."""
 
 
-def critic(state: SupervisorState) -> Command[Literal["router", "__end__"]]:
+def critic(state: SupervisorState) -> Command[Literal["eligibility_worker", "rag_worker", "__end__"]]:
     human_messages = [m for m in state["messages"] if m.type == "human"]
     question = human_messages[-1].content
     answer = state["messages"][-1].content
@@ -105,11 +115,22 @@ def critic(state: SupervisorState) -> Command[Literal["router", "__end__"]]:
     response = llm.invoke(prompt)
     approved = "approved" in response.content.strip().lower()
 
-    if approved or retry_count >= MAX_RETRIES:
+    if approved:
         return Command(goto=END)
 
-    # rejected, retries remain — loop back through the router for a fresh attempt
-    return Command(goto="router", update={"retry_count": retry_count + 1})
+    if retry_count >= MAX_RETRIES:
+        # gave up after exhausting retries — the answer is still unverified,
+        # so say so explicitly instead of returning it as if it passed
+        disclaimer = (
+            "\n\nNote: this answer could not be fully verified against sources "
+            "after multiple attempts — please double-check it independently."
+        )
+        return Command(goto=END, update={"messages": [AIMessage(content=answer + disclaimer)]})
+
+    # rejected, retries remain — retry the SAME worker directly, no need to
+    # re-classify the question through router again (same answer every time,
+    # wastes an LLM call, and risks flipping to a different worker on retry)
+    return Command(goto=state["current_worker"], update={"retry_count": retry_count + 1})
 
 
 def build_supervisor_graph(checkpointer=None):
