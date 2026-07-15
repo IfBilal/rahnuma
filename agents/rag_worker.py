@@ -19,6 +19,7 @@ from typing import TypedDict
 from langchain.chat_models import init_chat_model
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
+from fastembed.rerank.cross_encoder import TextCrossEncoder
 from langgraph.graph import StateGraph
 from langgraph.graph.message import add_messages
 from typing_extensions import Annotated
@@ -46,7 +47,10 @@ def load_all_chunks():
     return chunks
 
 
-def build_hybrid_retriever(k: int = 5):
+def build_hybrid_retriever(k: int = 10):
+    # retrieve more candidates than we ultimately want — the reranker below
+    # narrows these down to the truly best matches, not just the first ones
+    # each individual retriever happened to find
     vector_retriever = store.as_retriever(search_kwargs={"k": k})
     bm25_retriever = BM25Retriever.from_documents(load_all_chunks())
     bm25_retriever.k = k
@@ -55,6 +59,15 @@ def build_hybrid_retriever(k: int = 5):
 
 retriever = build_hybrid_retriever()
 web_graph = build_web_graph()
+
+# cross-encoder reranker (ONNX via fastembed, no torch — same reasoning as
+# the embedding model choice). Unlike the bi-encoder embeddings used for
+# initial retrieval, a cross-encoder scores the query and each candidate
+# document TOGETHER in one pass, which is slower but far more precise —
+# exactly why it's used to re-score a small candidate set, not the whole
+# corpus.
+reranker = TextCrossEncoder(model_name="Xenova/ms-marco-MiniLM-L-6-v2")
+RERANK_TOP_N = 10
 
 
 class RAGState(TypedDict):
@@ -82,10 +95,17 @@ Conversation:
 
 
 def retrieve(state: RAGState) -> dict:
-    docs = retriever.invoke(state["rewritten_query"])
+    query = state["rewritten_query"]
+    docs = retriever.invoke(query)
+
+    scores = list(reranker.rerank(query, [doc.page_content for doc in docs]))
+    reranked = sorted(zip(docs, scores), key=lambda pair: pair[1], reverse=True)
+    top_docs = [doc for doc, score in reranked[:RERANK_TOP_N]]
+
     context = "\n\n".join(
-        f"[{doc.metadata.get('university', 'unknown')}, Page {doc.metadata.get('page', '?')}]: {doc.page_content}"
-        for doc in docs
+        f"[{doc.metadata.get('university', 'unknown')}, {doc.metadata.get('source', 'unknown')}, "
+        f"Page {doc.metadata.get('page', '?')}]: {doc.page_content}"
+        for doc in top_docs
     )
     return {"context": context}
 
