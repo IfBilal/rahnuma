@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import os
 from typing import Literal
 
 from langchain.chat_models import init_chat_model
@@ -20,6 +21,10 @@ from agents.eligibility import eligibility_agent
 from agents.rag_worker import build_rag_graph
 
 llm = init_chat_model("groq:llama-3.3-70b-versatile")
+
+# raw psycopg (used by PostgresSaver) wants a plain postgresql:// string,
+# not the "+psycopg" SQLAlchemy dialect suffix langchain_postgres needs.
+CHECKPOINT_DB_URL = os.environ["DATABASE_URL"].replace("postgresql+psycopg://", "postgresql://")
 
 ROUTING_PROMPT = """Classify the user's question into exactly one category:
 

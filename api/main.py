@@ -15,14 +15,14 @@ from fastapi import FastAPI
 from langgraph.checkpoint.postgres import PostgresSaver
 from pydantic import BaseModel
 
-from agents.graph import CHECKPOINT_DB_URL, build_graph
+from agents.supervisor import CHECKPOINT_DB_URL, build_supervisor_graph
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     with PostgresSaver.from_conn_string(CHECKPOINT_DB_URL) as checkpointer:
         checkpointer.setup()  # idempotent — safe to call on every startup
-        app.state.graph = build_graph(checkpointer)
+        app.state.graph = build_supervisor_graph(checkpointer)
         yield
     # the `with` block closes the Postgres connection here, on server shutdown
 
