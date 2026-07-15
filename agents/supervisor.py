@@ -22,6 +22,7 @@ from typing_extensions import Annotated
 
 from agents.eligibility import eligibility_agent
 from agents.rag_worker import build_rag_graph
+from agents.profile import extract_facts, confirm_and_save
 
 llm = init_chat_model("groq:llama-3.3-70b-versatile")
 
@@ -37,6 +38,11 @@ class SupervisorState(TypedDict):
     context: str  # sources the last worker used, so the critic can check grounding
     retry_count: int
     current_worker: str  # which worker produced the last answer, so critic can retry it directly
+    user_id: str  # identifies the student, for cross-thread profile memory
+    extracted_facts: dict  # profile facts found in this message, if any
+    profile_result: str  # status of the profile save, kept separate from
+    # `messages` since two independent branches (answer + profile) both
+    # writing to messages makes "last message" ambiguous — see profile.py
 
 
 ROUTING_PROMPT = """Classify the user's question into exactly one category:
@@ -133,33 +139,52 @@ def critic(state: SupervisorState) -> Command[Literal["eligibility_worker", "rag
     return Command(goto=state["current_worker"], update={"retry_count": retry_count + 1})
 
 
-def build_supervisor_graph(checkpointer=None):
+def build_supervisor_graph(checkpointer=None, store=None):
     graph_builder = StateGraph(SupervisorState)
     graph_builder.add_node("router", router)
     graph_builder.add_node("eligibility_worker", eligibility_worker)
     graph_builder.add_node("rag_worker", rag_worker)
     graph_builder.add_node("critic", critic)
+    graph_builder.add_node("extract_facts", extract_facts)
+    graph_builder.add_node("confirm_and_save", confirm_and_save)
 
+    # answering the question and capturing profile facts run in parallel —
+    # neither depends on the other, both read the same incoming message
     graph_builder.add_edge(START, "router")
     graph_builder.add_edge("eligibility_worker", "critic")
     graph_builder.add_edge("rag_worker", "critic")
 
-    return graph_builder.compile(checkpointer=checkpointer)
+    graph_builder.add_edge(START, "extract_facts")
+    graph_builder.add_edge("extract_facts", "confirm_and_save")
+
+    return graph_builder.compile(checkpointer=checkpointer, store=store)
 
 
 if __name__ == "__main__":
-    graph = build_supervisor_graph()
+    from langgraph.checkpoint.postgres import PostgresSaver
+    from langgraph.store.postgres import PostgresStore
 
-    print("--- Eligibility question ---")
-    result = graph.invoke(
-        {"messages": [{"role": "user", "content": "My matric is 90%, FSc is 85%, test 80%. What's my FAST BS Engineering merit?"}]}
-    )
-    print(result["messages"][-1].content)
-    print(f"(retries used: {result.get('retry_count', 0)})")
+    with PostgresSaver.from_conn_string(CHECKPOINT_DB_URL) as checkpointer, \
+         PostgresStore.from_conn_string(CHECKPOINT_DB_URL) as store:
+        checkpointer.setup()
+        store.setup()
+        graph = build_supervisor_graph(checkpointer=checkpointer, store=store)
 
-    print("\n--- General question ---")
-    result2 = graph.invoke(
-        {"messages": [{"role": "user", "content": "What scholarships does GIKI offer?"}]}
-    )
-    print(result2["messages"][-1].content)
-    print(f"(retries used: {result2.get('retry_count', 0)})")
+        config = {"configurable": {"thread_id": "supervisor-test-1"}}
+
+        print("--- Eligibility question, with profile facts mentioned ---")
+        result = graph.invoke(
+            {
+                "messages": [{"role": "user", "content": "My matric is 90%, FSc is 85%, test 80%. What's my FAST BS Engineering merit?"}],
+                "user_id": "student-99",
+            },
+            config=config,
+        )
+        print("Answer:", result["messages"][-1].content)
+        print(f"(retries used: {result.get('retry_count', 0)})")
+        if "__interrupt__" in result:
+            print("Profile branch paused:", result["__interrupt__"][0].value)
+
+            print("\n--- Resuming profile confirmation ---")
+            resumed = graph.invoke(Command(resume=True), config=config)
+            print("Profile branch:", resumed["profile_result"])

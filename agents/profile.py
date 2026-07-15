@@ -14,7 +14,6 @@ import os
 from typing import TypedDict
 
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import AIMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.store.postgres import PostgresStore
@@ -39,6 +38,12 @@ class ProfileState(TypedDict):
     messages: Annotated[list, add_messages]
     user_id: str
     extracted_facts: dict
+    profile_result: str  # status of the profile save attempt, kept OUT of the
+    # shared messages list — when this graph runs in parallel with another
+    # branch that also writes to messages (e.g. the supervisor's answer),
+    # add_messages doesn't guarantee "most recently added" ends up last in
+    # the list, so relying on messages[-1] to find "the new thing" breaks.
+    # A dedicated field has no such ambiguity.
 
 
 def extract_facts(state: ProfileState) -> dict:
@@ -58,7 +63,7 @@ def extract_facts(state: ProfileState) -> dict:
 def confirm_and_save(state: ProfileState, store) -> dict:
     facts = state["extracted_facts"]
     if not facts:
-        return {"messages": [AIMessage(content="Nothing profile-worthy to save from that message.")]}
+        return {"profile_result": ""}
 
     existing = store.get(("students", state["user_id"]), "profile")
     existing_data = existing.value if existing else {}
@@ -72,11 +77,11 @@ def confirm_and_save(state: ProfileState, store) -> dict:
     )
 
     if not approved:
-        return {"messages": [AIMessage(content="Okay, I won't save those details to your profile.")]}
+        return {"profile_result": "Declined — nothing saved to your profile."}
 
     updated = {**existing_data, **facts}
     store.put(("students", state["user_id"]), "profile", updated)
-    return {"messages": [AIMessage(content=f"Saved to your profile: {facts}")]}
+    return {"profile_result": f"Saved to your profile: {facts}"}
 
 
 def build_profile_graph(checkpointer=None, store=None):
@@ -112,7 +117,7 @@ if __name__ == "__main__":
 
         print("\n--- Resuming with approval ---")
         final = graph.invoke(Command(resume=True), config=config)
-        print(final["messages"][-1].content)
+        print(final["profile_result"])
 
         print("\n--- Verifying it actually persisted ---")
         saved = store.get(("students", "student-42"), "profile")
