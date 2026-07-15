@@ -1,9 +1,9 @@
 """
 Supervisor: routes a question to either the eligibility subgraph (merit
 calculation, given marks) or the RAG worker (general corpus questions),
-using Command(goto=...) handoffs per the PRD architecture.
-
-Web worker and critic aren't built yet — routing is binary for now.
+using Command(goto=...) handoffs per the PRD architecture. Every answer
+passes through a critic before reaching the user — the PRD's "answer
+quality gate": grade against sources, retry up to 2x on rejection.
 """
 
 from dotenv import load_dotenv
@@ -11,11 +11,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
-from typing import Literal
+from typing import Literal, TypedDict
 
 from langchain.chat_models import init_chat_model
-from langgraph.graph import StateGraph, MessagesState, START
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
 from langgraph.types import Command
+from typing_extensions import Annotated
 
 from agents.eligibility import eligibility_agent
 from agents.rag_worker import build_rag_graph
@@ -25,6 +27,15 @@ llm = init_chat_model("groq:llama-3.3-70b-versatile")
 # raw psycopg (used by PostgresSaver) wants a plain postgresql:// string,
 # not the "+psycopg" SQLAlchemy dialect suffix langchain_postgres needs.
 CHECKPOINT_DB_URL = os.environ["DATABASE_URL"].replace("postgresql+psycopg://", "postgresql://")
+
+MAX_RETRIES = 2
+
+
+class SupervisorState(TypedDict):
+    messages: Annotated[list, add_messages]
+    context: str  # sources the last worker used, so the critic can check grounding
+    retry_count: int
+
 
 ROUTING_PROMPT = """Classify the user's question into exactly one category:
 
@@ -39,7 +50,7 @@ Question: {question}
 Answer with exactly one word: "eligibility" or "general"."""
 
 
-def router(state: MessagesState) -> Command[Literal["eligibility_worker", "rag_worker"]]:
+def router(state: SupervisorState) -> Command[Literal["eligibility_worker", "rag_worker"]]:
     question = state["messages"][-1].content
     response = llm.invoke(ROUTING_PROMPT.format(question=question))
     decision = response.content.strip().lower()
@@ -47,28 +58,70 @@ def router(state: MessagesState) -> Command[Literal["eligibility_worker", "rag_w
     return Command(goto=goto)
 
 
-def eligibility_worker(state: MessagesState) -> dict:
+def eligibility_worker(state: SupervisorState) -> dict:
     result = eligibility_agent.invoke({"messages": state["messages"]})
-    return {"messages": [result["messages"][-1]]}
+
+    # build a context string from the tool call + result, so the critic can
+    # verify the final answer's number actually matches what the tool returned
+    context_parts = []
+    for m in result["messages"]:
+        if getattr(m, "tool_calls", None):
+            for tc in m.tool_calls:
+                context_parts.append(f"Tool called: {tc['name']}({tc['args']})")
+        if m.type == "tool":
+            context_parts.append(f"Tool result: {m.content}")
+
+    return {"messages": [result["messages"][-1]], "context": "\n".join(context_parts)}
 
 
 rag_graph = build_rag_graph()
 
 
-def rag_worker(state: MessagesState) -> dict:
+def rag_worker(state: SupervisorState) -> dict:
     result = rag_graph.invoke({"messages": state["messages"]})
-    return {"messages": [result["messages"][-1]]}
+    return {"messages": [result["messages"][-1]], "context": result.get("context", "")}
+
+
+CRITIC_PROMPT = """Question: {question}
+
+Sources used to answer:
+{context}
+
+Proposed answer:
+{answer}
+
+Is this answer faithful to the sources above — no fabricated facts, no
+hallucinated numbers, no claims the sources don't support? Answer with
+exactly one word: "approved" or "rejected"."""
+
+
+def critic(state: SupervisorState) -> Command[Literal["router", "__end__"]]:
+    human_messages = [m for m in state["messages"] if m.type == "human"]
+    question = human_messages[-1].content
+    answer = state["messages"][-1].content
+    retry_count = state.get("retry_count", 0)
+
+    prompt = CRITIC_PROMPT.format(question=question, context=state.get("context", ""), answer=answer)
+    response = llm.invoke(prompt)
+    approved = "approved" in response.content.strip().lower()
+
+    if approved or retry_count >= MAX_RETRIES:
+        return Command(goto=END)
+
+    # rejected, retries remain — loop back through the router for a fresh attempt
+    return Command(goto="router", update={"retry_count": retry_count + 1})
 
 
 def build_supervisor_graph(checkpointer=None):
-    graph_builder = StateGraph(MessagesState)
+    graph_builder = StateGraph(SupervisorState)
     graph_builder.add_node("router", router)
     graph_builder.add_node("eligibility_worker", eligibility_worker)
     graph_builder.add_node("rag_worker", rag_worker)
+    graph_builder.add_node("critic", critic)
 
     graph_builder.add_edge(START, "router")
-    graph_builder.set_finish_point("eligibility_worker")
-    graph_builder.set_finish_point("rag_worker")
+    graph_builder.add_edge("eligibility_worker", "critic")
+    graph_builder.add_edge("rag_worker", "critic")
 
     return graph_builder.compile(checkpointer=checkpointer)
 
@@ -81,9 +134,11 @@ if __name__ == "__main__":
         {"messages": [{"role": "user", "content": "My matric is 90%, FSc is 85%, test 80%. What's my FAST BS Engineering merit?"}]}
     )
     print(result["messages"][-1].content)
+    print(f"(retries used: {result.get('retry_count', 0)})")
 
     print("\n--- General question ---")
     result2 = graph.invoke(
         {"messages": [{"role": "user", "content": "What scholarships does GIKI offer?"}]}
     )
     print(result2["messages"][-1].content)
+    print(f"(retries used: {result2.get('retry_count', 0)})")

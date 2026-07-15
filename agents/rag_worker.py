@@ -128,7 +128,9 @@ def fallback(state: RAGState) -> dict:
     # to the live web worker instead — for stale/missing corpus info (e.g.
     # current-cycle deadlines the prospectus doesn't have yet).
     result = web_graph.invoke({"messages": [{"role": "user", "content": state["rewritten_query"]}]})
-    return {"messages": [result["messages"][-1]]}
+    # overwrite context with what actually grounds the final answer (web
+    # results, not the corpus context that just failed the relevance check)
+    return {"messages": [result["messages"][-1]], "context": result.get("search_results", "")}
 
 
 def build_rag_graph(checkpointer=None):
