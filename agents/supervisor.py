@@ -15,6 +15,7 @@ from typing import Literal, TypedDict
 
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.types import Command
@@ -66,8 +67,11 @@ def router(state: SupervisorState) -> Command[Literal["eligibility_worker", "rag
     return Command(goto=goto)
 
 
-def eligibility_worker(state: SupervisorState) -> dict:
-    result = eligibility_agent.invoke({"messages": state["messages"]})
+def eligibility_worker(state: SupervisorState, config: RunnableConfig) -> dict:
+    # forward config so nested LLM calls inside eligibility_agent are visible
+    # to the supervisor's own streaming (astream_events) — without this, the
+    # nested graph's internal events don't propagate to the outer stream
+    result = eligibility_agent.invoke({"messages": state["messages"]}, config)
 
     # build a context string from the tool call + result, so the critic can
     # verify the final answer's number actually matches what the tool returned
@@ -89,8 +93,8 @@ def eligibility_worker(state: SupervisorState) -> dict:
 rag_graph = build_rag_graph()
 
 
-def rag_worker(state: SupervisorState) -> dict:
-    result = rag_graph.invoke({"messages": state["messages"]})
+def rag_worker(state: SupervisorState, config: RunnableConfig) -> dict:
+    result = rag_graph.invoke({"messages": state["messages"]}, config)
     return {
         "messages": [result["messages"][-1]],
         "context": result.get("context", ""),
