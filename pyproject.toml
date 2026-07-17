@@ -15,6 +15,7 @@ dependencies = [
     "langchain-postgres>=0.0.17",
     "langchain-tavily>=0.2.18",
     "langchain-text-splitters>=1.1.2",
+    "langsmith>=0.10.2",
     "langgraph>=1.2.9",
     "langgraph-checkpoint-postgres>=3.1.0",
     "numpy>=2.5.1",
@@ -32,3 +33,7 @@ dependencies = [
 dev = [
     "pytest>=9.1.1",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

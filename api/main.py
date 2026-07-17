@@ -26,6 +26,7 @@ load_dotenv()
 
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.postgres import PostgresStore
@@ -64,6 +65,7 @@ async def lifespan(app: FastAPI):
         checkpointer.setup()  # idempotent — safe to call on every startup
         store.setup()
         app.state.graph = build_supervisor_graph(checkpointer, store)
+        app.state.store = store
 
         async with AsyncPostgresSaver.from_conn_string(CHECKPOINT_DB_URL) as async_checkpointer, \
                    AsyncPostgresStore.from_conn_string(CHECKPOINT_DB_URL) as async_store:
@@ -76,6 +78,17 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+# The generated Next.js UI is served separately during local development.
+# Keep the allowed origins explicit so browser requests work without opening
+# this API to arbitrary websites.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 
 class ChatRequest(BaseModel):
@@ -99,9 +112,42 @@ class ConfirmResponse(BaseModel):
     profile_result: str
 
 
+class ProfileResponse(BaseModel):
+    profile: dict
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    """A lightweight liveness endpoint for the UI and local diagnostics."""
+    return {"status": "ok"}
+
+
+def graph_config(thread_id: str, route: str) -> dict:
+    """Attach useful, non-sensitive metadata to LangGraph/LangSmith runs.
+
+    LangGraph automatically emits traces when LANGSMITH_TRACING=true and a
+    LANGSMITH_API_KEY are present. We deliberately do not attach user profile
+    contents here: prompts are already visible in a trace, and profile data
+    should not become extra searchable metadata.
+    """
+    return {
+        "configurable": {"thread_id": thread_id},
+        "run_name": f"rahnuma-{route}",
+        "tags": ["rahnuma", route],
+        "metadata": {"thread_id": thread_id, "api_route": route},
+    }
+
+
+@app.get("/profiles/{user_id}")
+def get_profile(user_id: str) -> ProfileResponse:
+    """Return the confirmed long-term profile for one student, if it exists."""
+    item = app.state.store.get(("students", user_id), "profile")
+    return ProfileResponse(profile=item.value if item else {})
+
+
 @app.post("/chat")
 def chat(request: ChatRequest) -> ChatResponse:
-    config = {"configurable": {"thread_id": request.thread_id}}
+    config = graph_config(request.thread_id, "chat")
     result = app.state.graph.invoke(
         {"messages": [{"role": "user", "content": request.question}], "user_id": request.user_id},
         config=config,
@@ -119,7 +165,7 @@ def chat(request: ChatRequest) -> ChatResponse:
 
 @app.post("/chat/confirm")
 def confirm(request: ConfirmRequest) -> ConfirmResponse:
-    config = {"configurable": {"thread_id": request.thread_id}}
+    config = graph_config(request.thread_id, "profile-confirmation")
     result = app.state.graph.invoke(Command(resume=request.approved), config=config)
     return ConfirmResponse(profile_result=result["profile_result"])
 
@@ -131,7 +177,7 @@ def _sse(data: dict) -> str:
 @app.post("/chat/stream")
 async def chat_stream(request: ChatRequest) -> StreamingResponse:
     async def event_generator():
-        config = {"configurable": {"thread_id": request.thread_id}}
+        config = graph_config(request.thread_id, "chat-stream")
         in_answer_node = False
 
         async for event in app.state.async_graph.astream_events(

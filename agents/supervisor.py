@@ -41,9 +41,7 @@ class SupervisorState(TypedDict):
     current_worker: str  # which worker produced the last answer, so critic can retry it directly
     user_id: str  # identifies the student, for cross-thread profile memory
     extracted_facts: dict  # profile facts found in this message, if any
-    profile_result: str  # status of the profile save, kept separate from
-    # `messages` since two independent branches (answer + profile) both
-    # writing to messages makes "last message" ambiguous — see profile.py
+    profile_result: str  # status of the profile save
 
 
 ROUTING_PROMPT = """Classify the user's question into exactly one category:

@@ -19,55 +19,80 @@ from typing import TypedDict
 from langchain.chat_models import init_chat_model
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
+from langchain_core.documents import Document
 from fastembed.rerank.cross_encoder import TextCrossEncoder
 from langgraph.graph import StateGraph
 from langgraph.graph.message import add_messages
 from typing_extensions import Annotated
 
-from ingestion.chunker import chunk_pages
-from ingestion.loader import load_pdf
 from ingestion.store import get_vector_store
-from pathlib import Path
+import os
+from psycopg import connect
 
 from agents.web_worker import build_web_graph
 
 llm = init_chat_model("groq:llama-3.3-70b-versatile")
-store = get_vector_store()
 
 
-def load_all_chunks():
-    """Re-run load+chunk (no embedding) over the whole corpus, to build BM25's in-memory index."""
-    chunks = []
-    for university_dir in Path("corpus").iterdir():
-        if not university_dir.is_dir():
-            continue
-        for pdf in university_dir.glob("*.pdf"):
-            pages = load_pdf(pdf)
-            chunks.extend(chunk_pages(pages, source=pdf.name, university=university_dir.name))
-    return chunks
+def load_indexed_chunks() -> list[Document]:
+    """Load BM25's documents from pgvector instead of reparsing every PDF.
+
+    The earlier implementation re-read and chunked the raw corpus whenever a
+    serving process first received a RAG request. That made the first answer
+    slow and vulnerable to a single expensive PDF extraction. pgvector already
+    holds the exact post-ingestion text and citation metadata we need, so it is
+    the correct source for the in-memory lexical index.
+    """
+    connection_url = os.environ["DATABASE_URL"].replace("postgresql+psycopg://", "postgresql://")
+    with connect(connection_url) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT e.document, e.cmetadata
+            FROM langchain_pg_embedding AS e
+            JOIN langchain_pg_collection AS c ON e.collection_id = c.uuid
+            WHERE c.name = %s
+            """,
+            ("rahnuma_corpus",),
+        )
+        rows = cursor.fetchall()
+
+    if not rows:
+        raise RuntimeError("The Rahnuma corpus is empty. Run `python -m ingestion.run` first.")
+    return [Document(page_content=document, metadata=metadata or {}) for document, metadata in rows]
 
 
 def build_hybrid_retriever(k: int = 10):
     # retrieve more candidates than we ultimately want — the reranker below
     # narrows these down to the truly best matches, not just the first ones
     # each individual retriever happened to find
-    vector_retriever = store.as_retriever(search_kwargs={"k": k})
-    bm25_retriever = BM25Retriever.from_documents(load_all_chunks())
+    vector_retriever = get_vector_store().as_retriever(search_kwargs={"k": k})
+    bm25_retriever = BM25Retriever.from_documents(load_indexed_chunks())
     bm25_retriever.k = k
     return EnsembleRetriever(retrievers=[vector_retriever, bm25_retriever], weights=[0.5, 0.5])
 
 
-retriever = build_hybrid_retriever()
-web_graph = build_web_graph()
-
-# cross-encoder reranker (ONNX via fastembed, no torch — same reasoning as
-# the embedding model choice). Unlike the bi-encoder embeddings used for
-# initial retrieval, a cross-encoder scores the query and each candidate
-# document TOGETHER in one pass, which is slower but far more precise —
-# exactly why it's used to re-score a small candidate set, not the whole
-# corpus.
-reranker = TextCrossEncoder(model_name="Xenova/ms-marco-MiniLM-L-6-v2")
+# These resources are intentionally initialized lazily. Constructing PGVector
+# opens a database connection and loading the cross-encoder can download/load
+# an ONNX model. Doing either during an `import api.main` made health checks
+# and unrelated endpoints fail whenever Postgres was unavailable.
+_retriever = None
+_web_graph = None
+_reranker = None
 RERANK_TOP_N = 10
+
+
+def get_retrieval_runtime():
+    """Create expensive, process-wide RAG resources only when a RAG request arrives."""
+    global _retriever, _web_graph, _reranker
+    if _retriever is None:
+        _retriever = build_hybrid_retriever()
+    if _web_graph is None:
+        _web_graph = build_web_graph()
+    if _reranker is None:
+        # A cross-encoder scores query + candidate together. It is more precise
+        # than embeddings, so we use it only on the small retrieved candidate set.
+        _reranker = TextCrossEncoder(model_name="Xenova/ms-marco-MiniLM-L-6-v2")
+    return _retriever, _web_graph, _reranker
 
 
 class RAGState(TypedDict):
@@ -96,6 +121,7 @@ Conversation:
 
 def retrieve(state: RAGState) -> dict:
     query = state["rewritten_query"]
+    retriever, _, reranker = get_retrieval_runtime()
     docs = retriever.invoke(query)
 
     scores = list(reranker.rerank(query, [doc.page_content for doc in docs]))
@@ -147,6 +173,7 @@ def fallback(state: RAGState) -> dict:
     # corrective RAG: corpus retrieval failed the relevance check, so escalate
     # to the live web worker instead — for stale/missing corpus info (e.g.
     # current-cycle deadlines the prospectus doesn't have yet).
+    _, web_graph, _ = get_retrieval_runtime()
     result = web_graph.invoke({"messages": [{"role": "user", "content": state["rewritten_query"]}]})
     # overwrite context with what actually grounds the final answer (web
     # results, not the corpus context that just failed the relevance check)
