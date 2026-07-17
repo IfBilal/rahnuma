@@ -9,7 +9,7 @@ The point is not to make a generic admissions chatbot. The point is to make ever
 - Ask cited questions about admission requirements, programs, fees, scholarships, and policies.
 - Provide marks and receive a deterministic aggregate for FAST, NUST, COMSATS, GIKI, or UET.
 - Ask follow-ups; the RAG worker rewrites them into standalone retrieval queries.
-- Let Rahnuma remember marks, budget, city, and preferred universities—but only after an explicit confirmation.
+- Create an account, then let Rahnuma remember marks, budget, city, and preferred universities—but only after an explicit confirmation.
 - See live progress and streamed answer tokens in the Next.js UI.
 
 ## System map
@@ -255,15 +255,40 @@ flowchart LR
 
 The FastAPI lifespan creates sync saver/store for normal JSON endpoints and async saver/store for SSE. They point to the same Postgres database, so streaming and non-streaming requests share the same truth.
 
+## Authentication and profile ownership
+
+Clerk owns registration, sign-in, password handling, sessions, and the browser
+session token. Rahnuma never stores a password or mints its own user JWT.
+
+```text
+Clerk sign-up/sign-in UI
+        ↓ Clerk session token (Bearer header)
+Next.js frontend ──────────────────────────> FastAPI
+                                               ↓ verifies token/JWKS
+                                         Clerk user ID (`sub`)
+                                               ↓
+                         PostgresStore: ("students", clerk_user_id) / "profile"
+```
+
+Every profile and chat endpoint is protected. The API verifies the Clerk token,
+reads the stable Clerk `sub` claim, and passes that ID into the LangGraph
+profile branch. A browser can no longer choose another user's `user_id` in a
+request body. `thread_id` remains a client-generated conversation identifier;
+the profile owner always comes from the verified Clerk session.
+
+For local development, use a Clerk development instance (`pk_test_...` and
+`sk_test_...`). This is the same architecture used after deployment; only the
+environment keys and allowed origin change.
+
 ## API and streaming contract
 
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | Lightweight liveness response: `{ "status": "ok" }`. |
-| `GET /profiles/{user_id}` | Reads the student’s confirmed profile. |
-| `POST /chat` | Runs the synchronous graph and returns an answer plus any pending profile confirmation. |
-| `POST /chat/confirm` | Resumes the interrupted profile branch with `approved: true` or `false`. |
-| `POST /chat/stream` | Runs the async graph and emits Server-Sent Events. |
+| `GET /profiles/me` | Reads the signed-in student’s confirmed profile. |
+| `POST /chat` | Requires Clerk auth; runs the synchronous graph and returns an answer plus any pending profile confirmation. |
+| `POST /chat/confirm` | Requires Clerk auth; resumes the signed-in user's interrupted profile branch with `approved: true` or `false`. |
+| `POST /chat/stream` | Requires Clerk auth; runs the async graph and emits Server-Sent Events. |
 
 `/chat/stream` emits JSON SSE frames with three event shapes:
 
@@ -281,8 +306,9 @@ The generated Next.js app lives in [`frontend/`](frontend/). It provides:
 
 - A responsive admissions chat interface.
 - Live agent-progress messages and token streaming.
-- Persistent browser-side `user_id` and `thread_id` UUIDs.
-- A profile panel backed by `GET /profiles/{user_id}`.
+- Clerk sign-up/sign-in and account menu.
+- A persistent browser-side `thread_id` UUID for conversation checkpoints.
+- A profile panel backed by authenticated `GET /profiles/me`.
 - A proposed-profile confirmation card calling `POST /chat/confirm`.
 - Starter prompts, error states, and an explicit source-trust explanation.
 
@@ -312,12 +338,21 @@ Copy [`.env.example`](.env.example) to `.env`, then provide the required values:
 DATABASE_URL=postgresql+psycopg://rahnuma:rahnuma_dev@localhost:5432/rahnuma
 GROQ_API_KEY=...
 TAVILY_API_KEY=...
+CLERK_SECRET_KEY=sk_test_...
+CLERK_PUBLISHABLE_KEY=pk_test_...
 LANGSMITH_TRACING=true             # optional
 LANGSMITH_API_KEY=...              # optional
 LANGSMITH_PROJECT=rahnuma-local    # optional
 ```
 
 `GOOGLE_API_KEY` and `HF_TOKEN` are used only by their respective configured model/download workflows.
+
+In `frontend/.env.local`, set:
+
+```text
+NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_...
+```
 
 ### 2. Start the database
 

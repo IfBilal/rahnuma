@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from langgraph.checkpoint.postgres import PostgresSaver
@@ -35,6 +35,7 @@ from langgraph.types import Command
 from pydantic import BaseModel
 
 from agents.supervisor import CHECKPOINT_DB_URL, build_supervisor_graph
+from api.auth import get_current_user
 
 # node names whose *start* is worth telling the user about — translated to
 # a friendly progress message. Anything not listed here (grade, critic,
@@ -94,7 +95,6 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     question: str
     thread_id: str
-    user_id: str
 
 
 class ChatResponse(BaseModel):
@@ -138,18 +138,18 @@ def graph_config(thread_id: str, route: str) -> dict:
     }
 
 
-@app.get("/profiles/{user_id}")
-def get_profile(user_id: str) -> ProfileResponse:
+@app.get("/profiles/me")
+def get_profile(user: dict = Depends(get_current_user)) -> ProfileResponse:
     """Return the confirmed long-term profile for one student, if it exists."""
-    item = app.state.store.get(("students", user_id), "profile")
+    item = app.state.store.get(("students", user["id"]), "profile")
     return ProfileResponse(profile=item.value if item else {})
 
 
 @app.post("/chat")
-def chat(request: ChatRequest) -> ChatResponse:
+def chat(request: ChatRequest, user: dict = Depends(get_current_user)) -> ChatResponse:
     config = graph_config(request.thread_id, "chat")
     result = app.state.graph.invoke(
-        {"messages": [{"role": "user", "content": request.question}], "user_id": request.user_id},
+        {"messages": [{"role": "user", "content": request.question}], "user_id": user["id"]},
         config=config,
     )
 
@@ -164,7 +164,7 @@ def chat(request: ChatRequest) -> ChatResponse:
 
 
 @app.post("/chat/confirm")
-def confirm(request: ConfirmRequest) -> ConfirmResponse:
+def confirm(request: ConfirmRequest, user: dict = Depends(get_current_user)) -> ConfirmResponse:
     config = graph_config(request.thread_id, "profile-confirmation")
     result = app.state.graph.invoke(Command(resume=request.approved), config=config)
     return ConfirmResponse(profile_result=result["profile_result"])
@@ -175,13 +175,13 @@ def _sse(data: dict) -> str:
 
 
 @app.post("/chat/stream")
-async def chat_stream(request: ChatRequest) -> StreamingResponse:
+async def chat_stream(request: ChatRequest, user: dict = Depends(get_current_user)) -> StreamingResponse:
     async def event_generator():
         config = graph_config(request.thread_id, "chat-stream")
         in_answer_node = False
 
         async for event in app.state.async_graph.astream_events(
-            {"messages": [{"role": "user", "content": request.question}], "user_id": request.user_id},
+            {"messages": [{"role": "user", "content": request.question}], "user_id": user["id"]},
             config=config,
             version="v2",
         ):

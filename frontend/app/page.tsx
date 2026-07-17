@@ -1,12 +1,12 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
+import { SignInButton, SignUpButton, UserButton, useAuth } from "@clerk/nextjs";
 
 type Message = { role: "user" | "assistant"; content: string };
 type Profile = Record<string, string | number | string[]>;
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
-const USER_ID_KEY = "rahnuma-user-id";
 const THREAD_ID_KEY = "rahnuma-thread-id";
 
 function stableId(key: string) {
@@ -19,6 +19,7 @@ function stableId(key: string) {
 }
 
 export default function Home() {
+  const { getToken, isLoaded, userId } = useAuth();
   const [messages, setMessages] = useState<Message[]>([
     { role: "assistant", content: "Assalamualaikum — I’m Rahnuma. Ask about admissions, fees, scholarships, or share your marks for a merit calculation." },
   ]);
@@ -31,26 +32,27 @@ export default function Home() {
 
   // Next renders the initial shell on the server too. localStorage is only
   // available after hydration, so create stable conversation IDs in an effect.
-  const [ids, setIds] = useState({ userId: "", threadId: "" });
+  const [threadId, setThreadId] = useState("");
 
   useEffect(() => {
-    setIds({ userId: stableId(USER_ID_KEY), threadId: stableId(THREAD_ID_KEY) });
+    setThreadId(stableId(THREAD_ID_KEY));
   }, []);
 
   async function refreshProfile() {
-    if (!ids.userId) return;
-    const response = await fetch(`${API_BASE}/profiles/${ids.userId}`);
+    if (!userId) return;
+    const token = await getToken();
+    const response = await fetch(`${API_BASE}/profiles/me`, { headers: { Authorization: `Bearer ${token}` } });
     if (!response.ok) throw new Error("Could not load your profile.");
     const data = await response.json();
     setProfile(data.profile);
   }
 
-  useEffect(() => { void refreshProfile().catch(() => undefined); }, [ids.userId]);
+  useEffect(() => { void refreshProfile().catch(() => undefined); }, [userId]);
 
   async function sendQuestion(event: FormEvent) {
     event.preventDefault();
     const trimmed = question.trim();
-    if (!trimmed || isLoading) return;
+    if (!trimmed || isLoading || !threadId) return;
 
     setQuestion("");
     setError("");
@@ -59,10 +61,12 @@ export default function Home() {
     setMessages((current) => [...current, { role: "user", content: trimmed }, { role: "assistant", content: "" }]);
 
     try {
+      const token = await getToken();
+      if (!token) throw new Error("Your session expired. Please sign in again.");
       const response = await fetch(`${API_BASE}/chat/stream`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: trimmed, thread_id: ids.threadId, user_id: ids.userId }),
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ question: trimmed, thread_id: threadId }),
       });
       if (!response.ok || !response.body) throw new Error("The advisor could not start. Is the API running?");
 
@@ -106,10 +110,12 @@ export default function Home() {
 
   async function confirmProfile(approved: boolean) {
     try {
+      const token = await getToken();
+      if (!token) throw new Error("Your session expired. Please sign in again.");
       const response = await fetch(`${API_BASE}/chat/confirm`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ thread_id: ids.threadId, approved }),
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ thread_id: threadId, approved }),
       });
       if (!response.ok) throw new Error("Could not save that profile update.");
       setPendingProfile(null);
@@ -119,10 +125,14 @@ export default function Home() {
     }
   }
 
+  if (!isLoaded) return <main className="auth-shell"><p>Loading your admissions desk…</p></main>;
+
+  if (!userId) return <main className="auth-shell"><header className="auth-nav"><div className="brand"><div className="brand-mark">ر</div><div><p className="eyebrow">ADMISSIONS, GROUNDED</p><h1>Rahnuma</h1></div></div><SignInButton mode="modal"><button className="nav-signin">Sign in</button></SignInButton></header><section className="auth-hero"><div className="auth-copy"><p className="eyebrow">THE ADMISSIONS DESK, REBUILT</p><h2>Choose your future<br />with <em>proof.</em></h2><p>Stop comparing hearsay. Rahnuma turns official prospectuses, merit formulas, and your actual profile into a clear next move.</p><div className="auth-actions"><SignUpButton mode="modal"><button>Build my shortlist <span>↗</span></button></SignUpButton><span>No credit card. Your profile stays yours.</span></div></div><div className="auth-proof"><div className="proof-number">05</div><p>seed universities<br />grounded in source docs</p><div className="proof-rule" /><div className="proof-row"><b>FAST</b><span>Merit calculator</span><i>↗</i></div><div className="proof-row"><b>NUST</b><span>Programs & scholarships</span><i>↗</i></div><div className="proof-row"><b>COMSATS</b><span>Fees & admissions</span><i>↗</i></div><small>Every number is either cited or calculated.</small></div></section><footer className="auth-footer"><span>BUILT FOR PAKISTANI STUDENTS</span><span>OFFICIAL SOURCES · HUMAN CONFIRMATION · NO GUESSWORK</span></footer></main>;
+
   return (
     <main>
       <aside className="sidebar">
-        <div className="brand"><div className="brand-mark">ر</div><div><p className="eyebrow">ADMISSIONS, GROUNDED</p><h1>Rahnuma</h1></div></div>
+        <div className="brand"><div className="brand-mark">ر</div><div><p className="eyebrow">ADMISSIONS, GROUNDED</p><h1>Rahnuma</h1></div><div className="user-menu"><UserButton /></div></div>
         <p className="brand-copy">A clearer route through Pakistan&apos;s university admissions.</p>
         <section className="profile"><div className="section-title"><div><p className="eyebrow">REMEMBERS YOU</p><h2>Your profile</h2></div><button onClick={() => void refreshProfile()} aria-label="Refresh profile">↻</button></div>
           {Object.keys(profile).length === 0 ? <p className="muted">Share your marks, city, budget, or university preferences. Rahnuma will ask before saving them.</p> : <dl>{Object.entries(profile).map(([key, value]) => <div key={key}><dt>{key.replaceAll("_", " ")}</dt><dd>{Array.isArray(value) ? value.join(", ") : String(value)}</dd></div>)}</dl>}
@@ -139,7 +149,7 @@ export default function Home() {
           {error && <p className="error">{error}</p>}
         </div>
         {pendingProfile && <section className="confirm"><div><strong>Save this profile update?</strong><pre>{JSON.stringify(pendingProfile.proposed_changes, null, 2)}</pre></div><div><button className="ghost" onClick={() => void confirmProfile(false)}>Not now</button><button onClick={() => void confirmProfile(true)}>Save profile</button></div></section>}
-        <form onSubmit={sendQuestion}><div className="input-wrap"><textarea value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Ask about admissions, merit, fees, or scholarships…" rows={2} /><span>↵ to send</span></div><button type="submit" disabled={isLoading || !question.trim() || !ids.userId} aria-label="Ask Rahnuma"><span>{isLoading ? "···" : "↑"}</span></button></form>
+        <form onSubmit={sendQuestion}><div className="input-wrap"><textarea value={question} onChange={(event) => setQuestion(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} placeholder="Ask about admissions, merit, fees, or scholarships…" rows={2} /><span><b>Enter</b> to send · <b>Shift + Enter</b> for a new line</span></div><button type="submit" disabled={isLoading || !question.trim() || !threadId} aria-label="Ask Rahnuma"><span>{isLoading ? "···" : "↑"}</span></button></form>
         <p className="composer-note">Rahnuma cites the source behind its claims. Your profile is never saved without confirmation.</p>
       </section>
     </main>
